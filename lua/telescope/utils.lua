@@ -91,8 +91,12 @@ utils.quickfix_items_to_entries = function(locations)
 end
 
 utils.filter_symbols = function(results, opts)
-  if opts.symbols == nil then
+  if opts.symbols == nil and not opts.ignore_symbols then
     return results
+  elseif opts.ignore_symbols then -- @fdschmidt93 is this enough for the purpose of ignore some symbol?
+    return vim.tbl_filter(function(item)
+      return not vim.tbl_contains(opts.ignore_symbols, string.lower(item.kind))
+    end, results)
   end
   local valid_symbols = vim.tbl_map(string.lower, vim.lsp.protocol.SymbolKind)
 
