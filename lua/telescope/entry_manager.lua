@@ -147,7 +147,7 @@ function EntryManager:window(start, finish)
       table.insert(results, val[1])
     end
 
-    if idx >= finish then
+    if idx >= finish or idx >= self.max_results then
       break
     end
   end

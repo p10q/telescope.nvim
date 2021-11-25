@@ -327,14 +327,11 @@ function Picker:find()
   self.prompt_prefix = prompt_prefix
   self:_reset_prefix_color()
 
-  -- TODO: This could be configurable in the future, but I don't know why you would
-  -- want to scroll through more than 10,000 items.
-  --
-  -- This just lets us stop doing stuff after tons of  things.
-  self.max_results = 1000
+  -- TODO: Need to make `self.offset` which will let me calculate the rows
+  -- and what not correctly (and scroll easily)
+  self.max_results = popup_opts.results.height
 
   local status_updater = self:get_status_updater(prompt_win, prompt_bufnr)
-  local debounced_status = debounce.throttle_leading(status_updater, 50)
 
   local tx, rx = channel.mpsc()
   self._on_lines = tx.send
@@ -342,51 +339,55 @@ function Picker:find()
   local find_id = self:_next_find_id()
 
   local count = 0
-  self.refresher = vim.loop.new_timer()
-  self.refresher:start(
-    0,
-    16,
-    vim.schedule_wrap(function()
-      count = count + 1
+  local redraw = vim.schedule_wrap(function()
+    count = count + 1
 
-      if self.manager then
-        local window = self.manager:window(1, vim.api.nvim_win_get_height(self.results_win))
-        if not self.manager.dirty then
-          return
-        end
-
-        self.manager.dirty = false
-
-        local displayed = {}
-        local highlights = {}
-        for row, entry in ipairs(window) do
-          local display, display_highlights = entry_display.resolve(self, entry)
-          row = self.scroller(#window, self.manager:num_results(), row) + 1
-
-          displayed[row] = self.entry_prefix .. display
-          highlights[row] = display_highlights
-          table.insert(displayed, self.entry_prefix .. display)
-          table.insert(highlights, display_highlights)
-        end
-
-        vim.api.nvim_buf_set_lines(self.results_bufnr, 0, -1, false, displayed)
-
-        local prompt = self:_get_prompt()
-        for row, display_highlights in ipairs(highlights) do
-          local caret = self.selection_caret:sub(1, -2)
-          local display = displayed[row]
-
-          row = row - 1
-          self.highlighter:hi_selection(row, caret)
-          self.highlighter:hi_display(row, caret, display_highlights)
-          self.highlighter:hi_sorter(row, prompt, display)
-          self.highlighter:hi_multiselect(row, self:is_multi_selected(window[row]))
-        end
-
-        print("Screen updated:", count, "set lines", #displayed)
+    if self.manager then
+      if not self.manager.dirty then
+        return
       end
-    end)
-  )
+
+      self.manager.dirty = false
+      local height = vim.api.nvim_win_get_height(self.results_win)
+      local window = self.manager:window(1, height)
+
+      self:_reset_highlights()
+
+      local displayed, highlights = {}, {}
+      for idx, entry in ipairs(window) do
+        local display, display_highlights = entry_display.resolve(self, entry)
+        local row = self:get_row(idx)
+
+        displayed[row] = self.entry_prefix .. display
+        highlights[row] = display_highlights
+      end
+
+      local lines = {}
+      for idx = 0, height do
+        lines[idx + 1] = displayed[idx] or ""
+      end
+
+      vim.api.nvim_buf_set_lines(self.results_bufnr, 0, -1, false, lines)
+
+      local prompt = self:_get_prompt()
+      local caret = self.selection_caret:sub(1, -2)
+      for row, display_highlights in pairs(highlights) do
+        local display = displayed[row]
+
+        self.highlighter:hi_selection(row, caret)
+        self.highlighter:hi_display(row, caret, display_highlights)
+        self.highlighter:hi_sorter(row, prompt, display)
+        self.highlighter:hi_multiselect(row, self:is_multi_selected(window[row]))
+      end
+
+      self:_do_selection(prompt)
+      status_updater { completed = false }
+
+      print("Screen updated:", count, "set lines", #displayed, #window)
+    end
+  end)
+  self.refresher = vim.loop.new_timer()
+  self.refresher:start(0, 50, redraw)
 
   local main_loop = async.void(function()
     self.sorter:_init()
@@ -428,16 +429,13 @@ function Picker:find()
       end
 
       local start_time = vim.loop.hrtime()
-
       local prompt = self:_get_next_filtered_prompt()
 
-      -- TODO: Entry manager should have a "bulk" setter. This can prevent a lot of redraws from display
       if self.cache_picker == false or not (self.cache_picker.is_cached == true) then
         self.sorter:_start(prompt)
         self.manager = EntryManager:new(self.max_results)
 
-        self:_reset_highlights()
-        local process_result = self:get_result_processor(find_id, prompt, debounced_status)
+        local process_result = self:get_result_processor(find_id, prompt)
         local process_complete = self:get_result_completor(self.results_bufnr, find_id, prompt, status_updater)
 
         local ok, msg = pcall(function()
@@ -450,7 +448,9 @@ function Picker:find()
 
         local diff_time = (vim.loop.hrtime() - start_time) / 1e6
         if self.debounce and diff_time < self.debounce then
+          self._sleeping = true
           async.util.sleep(self.debounce - diff_time)
+          self._sleeping = false
         end
       else
         -- TODO(scroll): This can only happen once, I don't like where it is.
@@ -865,10 +865,6 @@ function Picker:set_selection(row)
   --        Probably something with setting a row that's too high for this?
   --        Not sure.
   local set_ok, set_errmsg = pcall(function()
-    if true then
-      return
-    end
-
     local prompt = self:_get_prompt()
 
     -- This block handles removing the caret from beginning of previous selection (if still visible)
@@ -903,6 +899,7 @@ function Picker:set_selection(row)
       log.debug "Invalid buf somehow..."
       return
     end
+
     a.nvim_buf_set_lines(results_bufnr, row, row + 1, false, { display })
 
     -- don't highlight the ' ' at the end of caret
@@ -1043,12 +1040,11 @@ function Picker:get_status_updater(prompt_win, prompt_bufnr)
   end
 end
 
-function Picker:get_result_processor(find_id, prompt, status_updater)
+function Picker:get_result_processor(find_id, prompt)
   local count = 0
 
   local cb_add = function(score, entry)
     self.manager:add_entry(self, score, entry)
-    status_updater { completed = false }
   end
 
   local cb_filter = function(_)
