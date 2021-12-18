@@ -43,6 +43,8 @@ end
 files.live_grep = function(opts)
   local vimgrep_arguments = opts.vimgrep_arguments or conf.vimgrep_arguments
   local search_dirs = opts.search_dirs
+  local word = opts.search or vim.fn.expand "<cword>"
+  local search = word
   local grep_open_files = opts.grep_open_files
   opts.cwd = opts.cwd and vim.fn.expand(opts.cwd) or vim.loop.cwd()
 
@@ -99,6 +101,7 @@ files.live_grep = function(opts)
   pickers.new(opts, {
     prompt_title = "Live Grep",
     finder = live_grepper,
+    default_text = search,
     previewer = conf.grep_previewer(opts),
     -- TODO: It would be cool to use `--json` output for this
     -- and then we could get the highlight positions directly.
